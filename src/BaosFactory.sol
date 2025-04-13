@@ -3,6 +3,7 @@ pragma solidity 0.8.29;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {BAO} from "./BAO.sol";
+import {BaosDistribution} from "./BaosDistribution.sol";
 
 /**
  * @title BaosFactory
@@ -15,6 +16,7 @@ contract BaosFactory is Ownable {
     address public protocolAdmin;
 
     event BAOCreated(address indexed nftDao, string name, string symbol);
+    event DistributionCreated(address indexed baosContract, address indexed distributionContract);
 
     constructor(address _protocolAdmin) Ownable(msg.sender) {
         protocolAdmin = _protocolAdmin;
@@ -59,5 +61,24 @@ contract BaosFactory is Ownable {
     function setProtocolAdmin(address _protocolAdmin) external onlyOwner {
         require(_protocolAdmin != address(0), "Invalid protocol admin address");
         protocolAdmin = _protocolAdmin;
+    }
+    
+    /**
+     * @dev Deploy a BaosDistribution contract for a specific EquityNFT
+     * @param equityNftAddress Address of the EquityNFT contract to distribute to
+     * @return distributionAddress Address of the deployed BaosDistribution contract
+     */
+    function deployDistribution(address equityNftAddress) external returns (address distributionAddress) {
+        // Only protocol admin or factory owner can deploy distributions
+        require(msg.sender == protocolAdmin || msg.sender == owner(), "Not authorized");
+        require(equityNftAddress != address(0), "Invalid EquityNFT address");
+        
+        // Deploy a new BaosDistribution contract
+        BaosDistribution distribution = new BaosDistribution(equityNftAddress);
+        distributionAddress = address(distribution);
+        
+        emit DistributionCreated(equityNftAddress, distributionAddress);
+        
+        return distributionAddress;
     }
 } 

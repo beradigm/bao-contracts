@@ -7,38 +7,25 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /**
- * @title ContributorNFT Interface
- * @dev Minimal interface for interacting with ContributorNFT contract
- */
-interface IContributorNFT {
-    function ownerOf(uint256 tokenId) external view returns (address);
-    function getEquityShares(uint256 tokenId) external view returns (uint256);
-    function totalShares() external view returns (uint256);
-}
-
-/**
  * @title EquityNFT Interface
  * @dev Minimal interface for interacting with EquityNFT contract
  */
 interface IEquityNFT {
-    function contributorNFT() external view returns (address);
+    function ownerOf(uint256 tokenId) external view returns (address);
+    function getEquityShares(uint256 tokenId) external view returns (uint256);
+    function totalShares() external view returns (uint256);
     function owner() external view returns (address);
-    function contributorNFTIds(address contributor) external view returns (uint256);
 }
 
 /**
  * @title BaosDistribution
- * @dev Contract for distributing ETH and ERC20 tokens to ContributorNFT holders
+ * @dev Contract for distributing ETH and ERC20 tokens to EquityNFT holders
  * proportional to their equity shares
  */
 contract BaosDistribution is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
     
-    // The EquityNFT contract
     IEquityNFT public equityNFT;
-    
-    // NFT contract address
-    IContributorNFT public contributorNFT;
     
     // Mapping from token address to distribution ID to amount
     mapping(address => mapping(uint256 => uint256)) public distributions;
@@ -67,7 +54,6 @@ contract BaosDistribution is Ownable, ReentrancyGuard {
      */
     constructor(address _equityNFT) Ownable(msg.sender) {
         equityNFT = IEquityNFT(_equityNFT);
-        contributorNFT = IContributorNFT(equityNFT.contributorNFT());
         
         // Transfer ownership to the DAO manager
         transferOwnership(equityNFT.owner());
@@ -90,7 +76,7 @@ contract BaosDistribution is Ownable, ReentrancyGuard {
         
         address ETH_TOKEN = address(0);
         uint256 distributionId = currentDistributionId[ETH_TOKEN] + 1;
-        uint256 totalShares = contributorNFT.totalShares();
+        uint256 totalShares = equityNFT.totalShares();
         
         require(totalShares > 0, "No shares to distribute to");
         
@@ -113,9 +99,8 @@ contract BaosDistribution is Ownable, ReentrancyGuard {
     function createTokenDistribution(address token, uint256 amount) external onlyOwner {
         require(token != address(0), "Invalid token address");
         require(amount > 0, "Must distribute some tokens");
-        
         uint256 distributionId = currentDistributionId[token] + 1;
-        uint256 totalShares = contributorNFT.totalShares();
+        uint256 totalShares = equityNFT.totalShares();
         
         require(totalShares > 0, "No shares to distribute to");
         
@@ -145,11 +130,11 @@ contract BaosDistribution is Ownable, ReentrancyGuard {
         
         // Iterate through all NFTs up to maxNFTId
         for (uint256 tokenId = 1; tokenId <= maxNFTId; tokenId++) {
-            try contributorNFT.ownerOf(tokenId) returns (address nftOwner) {
+            try equityNFT.ownerOf(tokenId) returns (address nftOwner) {
                 // NFT exists, calculate token amount
                 uint256 tokenShares;
                 
-                try contributorNFT.getEquityShares(tokenId) returns (uint256 shares) {
+                try equityNFT.getEquityShares(tokenId) returns (uint256 shares) {
                     tokenShares = shares;
                 } catch {
                     // Skip if we can't get shares
@@ -201,11 +186,11 @@ contract BaosDistribution is Ownable, ReentrancyGuard {
         uint256 totalShares = totalSharesAtDistribution[token][distributionId];
         
         for (uint256 tokenId = startTokenId; tokenId <= endTokenId; tokenId++) {
-            try contributorNFT.ownerOf(tokenId) returns (address nftOwner) {
+            try equityNFT.ownerOf(tokenId) returns (address nftOwner) {
                 // NFT exists, calculate token amount
                 uint256 tokenShares;
                 
-                try contributorNFT.getEquityShares(tokenId) returns (uint256 shares) {
+                try equityNFT.getEquityShares(tokenId) returns (uint256 shares) {
                     tokenShares = shares;
                 } catch {
                     // Skip if we can't get shares
@@ -252,7 +237,7 @@ contract BaosDistribution is Ownable, ReentrancyGuard {
         uint256 totalAmount = distributions[token][distributionId];
         uint256 totalShares = totalSharesAtDistribution[token][distributionId];
         
-        try contributorNFT.getEquityShares(tokenId) returns (uint256 tokenShares) {
+        try equityNFT.getEquityShares(tokenId) returns (uint256 tokenShares) {
             return (totalAmount * tokenShares) / totalShares;
         } catch {
             return 0;
@@ -276,11 +261,11 @@ contract BaosDistribution is Ownable, ReentrancyGuard {
     }
     
     /**
-     * @dev Update the ContributorNFT contract in case it changes
-     * @param _contributorNFT New ContributorNFT contract address
+     * @dev Update the EquityNFT contract in case it changes
+     * @param _equityNFT New EquityNFT contract address
      */
-    function updateContributorNFT(address _contributorNFT) external onlyOwner {
-        contributorNFT = IContributorNFT(_contributorNFT);
+    function updateEquityNFT(address _equityNFT) external onlyOwner {
+        equityNFT = IEquityNFT(_equityNFT);
     }
     
     /**
