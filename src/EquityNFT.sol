@@ -49,7 +49,8 @@ contract EquityNFT is ERC721URIStorage, ERC2981, Ownable, AccessControl {
     address public daoManager;
     
     // Protocol admin for administrative functions
-    address public protocolAdmin;
+    // This is immutable after contract creation for security reasons
+    address public immutable protocolAdmin;
     
     // Royalty fee structure (in basis points, 10000 = 100%)
     uint256 public constant ROYALTY_FEE = 500; // 5% total royalty
@@ -59,10 +60,18 @@ contract EquityNFT is ERC721URIStorage, ERC2981, Ownable, AccessControl {
     // Accumulated native royalties
     uint256 public pendingRoyalties; // Total native token royalties received
     
+    // Keep track of supported ERC20 token royalties
+    address[] public supportedRoyaltyTokens;
+    mapping(address => bool) public isSupportedRoyaltyToken;
+    
     // Events
     event MetadataSet(uint256 tokenId, uint256 contribution, uint256 proportion, uint256 shares);
     event RoyaltyReceived(uint256 amount);
     event RoyaltyClaimed(address indexed recipient, uint256 amount, string role);
+    event ERC20RoyaltyReceived(address indexed tokenAddress, uint256 amount);
+    event ERC20RoyaltyClaimed(address indexed recipient, address indexed tokenAddress, uint256 amount, string role);
+    event RoyaltyTokenAdded(address indexed tokenAddress);
+    event RoyaltyTokenRemoved(address indexed tokenAddress);
     
     /**
      * @dev Constructor
@@ -82,6 +91,8 @@ contract EquityNFT is ERC721URIStorage, ERC2981, Ownable, AccessControl {
         ERC721(name, symbol)
         Ownable(initialOwner)
     {
+        require(_protocolAdmin != address(0), "Protocol admin cannot be zero address");
+        
         _baseTokenURI = baseURI;
         protocolAdmin = _protocolAdmin;
         daoManager = initialOwner; // DAO Manager is the contract owner
@@ -111,7 +122,7 @@ contract EquityNFT is ERC721URIStorage, ERC2981, Ownable, AccessControl {
      * @param minter Address to grant minter role to
      */
     function addMinter(address minter) external onlyOwner {
-        grantRole(MINTER_ROLE, minter);
+        _grantRole(MINTER_ROLE, minter);
     }
     
     /**
@@ -119,7 +130,7 @@ contract EquityNFT is ERC721URIStorage, ERC2981, Ownable, AccessControl {
      * @param minter Address to revoke minter role from
      */
     function removeMinter(address minter) external onlyOwner {
-        revokeRole(MINTER_ROLE, minter);
+        _revokeRole(MINTER_ROLE, minter);
     }
     
     /**
@@ -246,14 +257,23 @@ contract EquityNFT is ERC721URIStorage, ERC2981, Ownable, AccessControl {
     }
     
     /**
-     * @dev Helper to format wei as ether string
+     * @dev Helper to format wei as ether string with 2 decimal places
      * @param weiAmount Amount in wei
-     * @return Formatted ether amount
+     * @return Formatted ether amount with decimals
      */
     function _formatEther(uint256 weiAmount) internal pure returns (string memory) {
-        // Simple implementation - convert to ether by dividing by 10^18
-        uint256 ether_value = weiAmount / 1 ether;
-        return ether_value.toString();
+        // Convert to ether with 2 decimal precision
+        uint256 ether_whole = weiAmount / 1 ether;
+        uint256 ether_fraction = ((weiAmount % 1 ether) * 100) / 1 ether; // Get 2 decimal places
+        
+        // Format with decimal point
+        if (ether_fraction == 0) {
+            return string(abi.encodePacked(ether_whole.toString(), ".00"));
+        } else if (ether_fraction < 10) {
+            return string(abi.encodePacked(ether_whole.toString(), ".0", ether_fraction.toString()));
+        } else {
+            return string(abi.encodePacked(ether_whole.toString(), ".", ether_fraction.toString()));
+        }
     }
     
     /**
@@ -275,15 +295,6 @@ contract EquityNFT is ERC721URIStorage, ERC2981, Ownable, AccessControl {
         require(_ownerOf(tokenId) != address(0), "Token does not exist");
         if (totalShares == 0) return 0;
         return (equityShares[tokenId] * 10000) / totalShares;
-    }
-    
-    /**
-     * @dev Set new protocol admin
-     * @param newProtocolAdmin New protocol admin address
-     */
-    function setProtocolAdmin(address newProtocolAdmin) external onlyOwner {
-        require(newProtocolAdmin != address(0), "Invalid protocol admin");
-        protocolAdmin = newProtocolAdmin;
     }
     
     /**
@@ -327,25 +338,22 @@ contract EquityNFT is ERC721URIStorage, ERC2981, Ownable, AccessControl {
         );
         
         uint256 totalAmount = address(this).balance;
-        uint256 claimAmount;
-        string memory role;
         
-        // Calculate share based on caller
-        if (msg.sender == protocolAdmin) {
-            claimAmount = (totalAmount * ADMIN_SHARE) / ROYALTY_FEE;
-            role = "ProtocolAdmin";
-        } else {
-            claimAmount = (totalAmount * MANAGER_SHARE) / ROYALTY_FEE;
-            role = "DaoManager";
-        }
-        
-        // Transfer royalties
-        if (claimAmount > 0) {
-            // Native token transfer
-            (bool success,) = payable(msg.sender).call{value: claimAmount}("");
-            require(success, "Native transfer failed");
+        // Only process if there are royalties to distribute
+        if (totalAmount > 0) {
+            // Calculate each party's share
+            uint256 adminAmount = (totalAmount * ADMIN_SHARE) / ROYALTY_FEE;
+            uint256 managerAmount = (totalAmount * MANAGER_SHARE) / ROYALTY_FEE;
             
-            emit RoyaltyClaimed(msg.sender, claimAmount, role);
+            // Send to protocol admin
+            (bool adminSuccess,) = payable(protocolAdmin).call{value: adminAmount}("");
+            require(adminSuccess, "Protocol admin transfer failed");
+            emit RoyaltyClaimed(protocolAdmin, adminAmount, "ProtocolAdmin");
+            
+            // Send to DAO manager
+            (bool managerSuccess,) = payable(daoManager).call{value: managerAmount}("");
+            require(managerSuccess, "DAO manager transfer failed");
+            emit RoyaltyClaimed(daoManager, managerAmount, "DaoManager");
             
             // Update pending royalties
             pendingRoyalties = address(this).balance;
@@ -373,4 +381,130 @@ contract EquityNFT is ERC721URIStorage, ERC2981, Ownable, AccessControl {
         }
     }
     
+    /**
+     * @dev Add support for a new ERC20 token that can be received as royalties
+     * @param tokenAddress Address of the ERC20 token to support
+     */
+    function addRoyaltyToken(address tokenAddress) external onlyOwner {
+        require(tokenAddress != address(0), "Invalid token address");
+        require(!isSupportedRoyaltyToken[tokenAddress], "Token already supported");
+        
+        supportedRoyaltyTokens.push(tokenAddress);
+        isSupportedRoyaltyToken[tokenAddress] = true;
+        
+        emit RoyaltyTokenAdded(tokenAddress);
+    }
+    
+    /**
+     * @dev Remove support for an ERC20 token royalty
+     * @param tokenAddress Address of the ERC20 token to remove
+     */
+    function removeRoyaltyToken(address tokenAddress) external onlyOwner {
+        require(isSupportedRoyaltyToken[tokenAddress], "Token not supported");
+        
+        // Remove from the supported tokens array
+        for (uint256 i = 0; i < supportedRoyaltyTokens.length; i++) {
+            if (supportedRoyaltyTokens[i] == tokenAddress) {
+                // Replace with the last element and pop
+                supportedRoyaltyTokens[i] = supportedRoyaltyTokens[supportedRoyaltyTokens.length - 1];
+                supportedRoyaltyTokens.pop();
+                break;
+            }
+        }
+        
+        isSupportedRoyaltyToken[tokenAddress] = false;
+        emit RoyaltyTokenRemoved(tokenAddress);
+    }
+    
+    /**
+     * @dev Get all supported royalty tokens
+     * @return Array of ERC20 token addresses
+     */
+    function getSupportedRoyaltyTokens() external view returns (address[] memory) {
+        return supportedRoyaltyTokens;
+    }
+    
+    /**
+     * @dev Claim royalties for a specific ERC20 token
+     * @param tokenAddress ERC20 token address to claim royalties for
+     */
+    function claimERC20Royalties(address tokenAddress) external {
+        require(
+            msg.sender == protocolAdmin || msg.sender == daoManager,
+            "Only protocol admin or DAO manager can claim"
+        );
+        require(isSupportedRoyaltyToken[tokenAddress], "Token not supported");
+        
+        IERC20 token = IERC20(tokenAddress);
+        uint256 totalAmount = token.balanceOf(address(this));
+        
+        // Only process if there are royalties to distribute
+        if (totalAmount > 0) {
+            // Calculate each party's share
+            uint256 adminAmount = (totalAmount * ADMIN_SHARE) / ROYALTY_FEE;
+            uint256 managerAmount = (totalAmount * MANAGER_SHARE) / ROYALTY_FEE;
+            
+            // Send to protocol admin
+            token.safeTransfer(protocolAdmin, adminAmount);
+            emit ERC20RoyaltyClaimed(protocolAdmin, tokenAddress, adminAmount, "ProtocolAdmin");
+            
+            // Send to DAO manager
+            token.safeTransfer(daoManager, managerAmount);
+            emit ERC20RoyaltyClaimed(daoManager, tokenAddress, managerAmount, "DaoManager");
+        }
+    }
+    
+    /**
+     * @dev Get available ERC20 royalties for a role
+     * @param role Address of the role to check
+     * @param tokenAddress ERC20 token address to check
+     * @return Amount claimable by the role
+     */
+    function getAvailableERC20Royalties(address role, address tokenAddress) external view returns (uint256) {
+        require(
+            role == protocolAdmin || role == daoManager,
+            "Only protocol admin or DAO manager are eligible"
+        );
+        require(isSupportedRoyaltyToken[tokenAddress], "Token not supported");
+        
+        uint256 totalAmount = IERC20(tokenAddress).balanceOf(address(this));
+        
+        // Calculate share based on role
+        if (role == protocolAdmin) {
+            return (totalAmount * ADMIN_SHARE) / ROYALTY_FEE;
+        } else {
+            return (totalAmount * MANAGER_SHARE) / ROYALTY_FEE;
+        }
+    }
+    
+    /**
+     * @dev Handle ERC20 tokens that might be sent directly to the contract
+     * @param tokenAddress ERC20 token that was received
+     * @param amount Amount of tokens received
+     */
+    function onERC20Received(address tokenAddress, uint256 amount) external {
+        // Auto-add support if not already supported
+        if (!isSupportedRoyaltyToken[tokenAddress]) {
+            supportedRoyaltyTokens.push(tokenAddress);
+            isSupportedRoyaltyToken[tokenAddress] = true;
+            emit RoyaltyTokenAdded(tokenAddress);
+        }
+        
+        emit ERC20RoyaltyReceived(tokenAddress, amount);
+    }
+    
+    /**
+     * @dev Helper function to handle unexpected token transfers to this contract
+     * @param tokenAddress Address of the ERC20 token to rescue
+     */
+    function rescueERC20(address tokenAddress) external {
+        require(msg.sender == owner(), "Only owner can rescue tokens");
+        require(!isSupportedRoyaltyToken[tokenAddress], "Cannot rescue supported royalty token");
+        
+        IERC20 token = IERC20(tokenAddress);
+        uint256 balance = token.balanceOf(address(this));
+        if (balance > 0) {
+            token.safeTransfer(owner(), balance);
+        }
+    }
 } 

@@ -49,6 +49,13 @@ contract BAO is Ownable, ReentrancyGuard {
     // If maxPublicContributionAmount > 0, then you cannot contribute more than this in public rounds.
     uint256 public maxPublicContributionAmount; // In USD value (18 decimals)
     
+    // Flag to indicate if dynamic recalculation is enabled
+    // Set to false at finalization to lock in values
+    bool public dynamicRecalculationEnabled = true;
+    
+    // Timestamp when totalRaised was last updated
+    uint256 public lastTotalRaisedUpdate;
+    
     // Pyth Network integration
     IPyth public pythOracle;
     bytes32 public ethUsdPriceId; // Pyth price feed ID for ETH/USD
@@ -66,15 +73,16 @@ contract BAO is Ownable, ReentrancyGuard {
     address[] public supportedTokensList; // List of supported ERC20 tokens
 
     struct ContributionAmount {
-        uint256 amount;      // USD value of contribution (18 decimals)
+        uint256 amount;      // Cache of USD value (for backward compatibility)
         uint256 index;       // Index in contributors array
+        uint256 cachedAt;    // Timestamp when the USD value was last cached
     }
     
     // Token contribution record
     struct TokenContribution {
         address token;      // ETH (address(0)) or ERC20 token address
         uint256 amount;     // Raw token amount with token's native decimals
-        uint256 usdValue;   // USD value at time of contribution (18 decimals)
+        uint256 usdValue;   // USD value at time of contribution (18 decimals) - cached value
     }
     
     // Contributor records
@@ -82,7 +90,8 @@ contract BAO is Ownable, ReentrancyGuard {
     mapping(address => TokenContribution[]) public tokenContributions;   // All token contributions by address
     mapping(address => bool) public whitelist;
     address[] public whitelistArray;
-    mapping(address => bool) public claimed;
+    mapping(address => bool) public hasClaimedNFT;
+    mapping(address => bool) public hasRefunded;
     mapping(address => uint256) public contributorNFTIds;
     mapping(address => uint256) public contributorShares;
 
@@ -106,6 +115,10 @@ contract BAO is Ownable, ReentrancyGuard {
     event TokenRemoved(address indexed tokenAddress);
     event PythOracleSet(address indexed oracleAddress);
     event EthUsdPriceIdSet(bytes32 priceId);
+    event TotalRaisedUpdated(uint256 oldValue, uint256 newValue, string reason);
+    event DynamicRecalculationDisabled();
+    event ContributionValuesRecalculated(address indexed contributor, uint256 oldUsdValue, uint256 newUsdValue);
+    event OTCRefund(address indexed contributor, uint256 usdValue, string description);
 
     struct DaoConfig {
         // Basic DAO info
@@ -161,29 +174,148 @@ contract BAO is Ownable, ReentrancyGuard {
         }
     }
 
+    /**
+     * @notice Calculate the current USD value of a contributor's holdings
+     * @param contributor Address of the contributor
+     * @return Current USD value of their contributions
+     */
+    function getCurrentUsdContribution(address contributor) public view returns (uint256) {
+        // If dynamic recalculation is disabled, return the cached amount
+        if (!dynamicRecalculationEnabled) {
+            return contributions[contributor].amount;
+        }
+        
+        uint256 currentUsdValue = 0;
+        TokenContribution[] storage tokens = tokenContributions[contributor];
+        
+        for (uint256 i = 0; i < tokens.length; i++) {
+            TokenContribution storage t = tokens[i];
+            
+            // Skip OTC contributions - they keep their fixed USD value
+            if (t.token == address(1)) {
+                currentUsdValue += t.usdValue;
+                continue;
+            }
+            
+            // Skip contributions with tokens that are no longer supported
+            if (t.token != address(0) && !supportedTokens[t.token].isEnabled) {
+                continue;
+            }
+            
+            // Get the price ID based on token type
+            bytes32 priceId = t.token == address(0)
+                ? ethUsdPriceId
+                : supportedTokens[t.token].pythPriceId;
+                
+            try pythOracle.getEmaPriceNoOlderThan(priceId, maxPriceAgeSecs) returns (PythStructs.Price memory price) {
+                uint256 tokenUsdPrice = _convertPythPriceToUint(price, USD_DECIMALS);
+                
+                // Get token decimals
+                uint8 decimals = 18; // Default for ETH and most tokens
+                if (t.token != address(0)) {
+                    try IERC20Metadata(t.token).decimals() returns (uint8 d) {
+                        decimals = d;
+                    } catch {
+                        // Use default 18 decimals if we can't get it
+                    }
+                }
+                
+                // Calculate current USD value of this token contribution
+                currentUsdValue += (t.amount * tokenUsdPrice) / (10 ** decimals);
+            } catch {
+                // If price feed fails, use the cached USD value as fallback
+                currentUsdValue += t.usdValue;
+            }
+        }
+        
+        return currentUsdValue;
+    }
+    
+    /**
+     * @notice Calculate and update the current total raised amount
+     * @return New total raised amount
+     */
+    function updateTotalRaised() public returns (uint256) {
+        require(dynamicRecalculationEnabled, "Dynamic recalculation disabled");
+        
+        uint256 oldTotalRaised = totalRaised;
+        uint256 newTotalRaised = 0;
+        
+        for (uint256 i = 0; i < contributors.length; i++) {
+            address contributor = contributors[i].addr;
+            
+            // Get current USD value
+            uint256 currentValue = getCurrentUsdContribution(contributor);
+            
+            // Update the cached value for this contributor
+            contributions[contributor].amount = currentValue;
+            contributions[contributor].cachedAt = block.timestamp;
+            
+            // Add to total
+            newTotalRaised += currentValue;
+            
+            // Emit event for significant changes (more than 1%)
+            if (currentValue > contributions[contributor].amount && 
+                currentValue - contributions[contributor].amount > contributions[contributor].amount / 100) {
+                emit ContributionValuesRecalculated(contributor, contributions[contributor].amount, currentValue);
+            } else if (contributions[contributor].amount > currentValue && 
+                       contributions[contributor].amount - currentValue > contributions[contributor].amount / 100) {
+                emit ContributionValuesRecalculated(contributor, contributions[contributor].amount, currentValue);
+            }
+        }
+        
+        // Update total raised
+        totalRaised = newTotalRaised;
+        lastTotalRaisedUpdate = block.timestamp;
+        
+        // Check if goal has been reached
+        if (totalRaised >= fundraisingGoal && !goalReached) {
+            goalReached = true;
+        }
+        
+        emit TotalRaisedUpdated(oldTotalRaised, newTotalRaised, "Dynamic recalculation");
+        
+        return newTotalRaised;
+    }
+    
     function contribute() public payable nonReentrant {
         require(!goalReached, "Goal already reached");
         require(block.timestamp < fundraisingDeadline, "Deadline hit");
         require(msg.value > 0, "Contribution must be greater than 0");
         
-        // Get ETH/USD price from Pyth
-        PythStructs.Price memory ethPrice = pythOracle.getPrice(ethUsdPriceId);
-        // Validate the price feed data
-        _validatePythPrice(ethPrice, "ETH price feed stale or invalid");
+        // If user previously refunded, clear that flag when they contribute again
+        if (hasRefunded[msg.sender]) {
+            hasRefunded[msg.sender] = false;
+        }
+        
+        // Get ETH/USD price from Pyth using the recommended EMA price function
+        // This uses Exponential Moving Average (EMA) for more stable price data
+        PythStructs.Price memory ethPrice = pythOracle.getEmaPriceNoOlderThan(ethUsdPriceId, maxPriceAgeSecs);
         uint256 ethUsdPrice = _convertPythPriceToUint(ethPrice, USD_DECIMALS);
+        
+        // Check confidence interval for price
+        _validatePythPriceConfidence(ethPrice, "ETH price confidence interval too large");
         
         // Calculate the USD value of the contribution
         uint256 usdValue = (msg.value * ethUsdPrice) / 1 ether;
         
         require(usdValue >= minContributionAmount, "Below minimum contribution");
 
+        // For gating checks, always use latest contribution value
+        uint256 currentContribution = 0;
+        if (dynamicRecalculationEnabled) {
+            currentContribution = getCurrentUsdContribution(msg.sender);
+        } else {
+            currentContribution = contributions[msg.sender].amount;
+        }
+
         // Check whitelist and contribution limits in USD
         if (maxWhitelistAmount > 0) {
             require(whitelist[msg.sender], "You are not whitelisted");
-            require(contributions[msg.sender].amount + usdValue <= maxWhitelistAmount, "Exceeding maxWhitelistAmount");
+            require(currentContribution + usdValue <= maxWhitelistAmount, "Exceeding maxWhitelistAmount");
         } else if (maxPublicContributionAmount > 0) {
             require(
-                contributions[msg.sender].amount + usdValue <= maxPublicContributionAmount,
+                currentContribution + usdValue <= maxPublicContributionAmount,
                 "Exceeding maxPublicContributionAmount"
             );
         }
@@ -192,16 +324,27 @@ contract BAO is Ownable, ReentrancyGuard {
         uint256 effectiveUsdValue = usdValue;
         
         // If adding this contribution would exceed the fundraising goal in USD
-        if (totalRaised + usdValue > fundraisingGoal) {
-            effectiveUsdValue = fundraisingGoal - totalRaised;
+        // First, get updated total raised to make accurate decision
+        uint256 currentTotalRaised = totalRaised;
+        if (dynamicRecalculationEnabled && block.timestamp > lastTotalRaisedUpdate + 1 hours) {
+            // Only update if it's been more than an hour since last update
+            currentTotalRaised = updateTotalRaised();
+        }
+        
+        if (currentTotalRaised + usdValue > fundraisingGoal) {
+            effectiveUsdValue = fundraisingGoal - currentTotalRaised;
             effectiveContribution = (effectiveUsdValue * 1 ether) / ethUsdPrice;
-            payable(msg.sender).transfer(msg.value - effectiveContribution);
+            
+            // Use .call instead of .transfer for better compatibility with contracts
+            uint256 refundAmount = msg.value - effectiveContribution;
+            (bool success,) = payable(msg.sender).call{value: refundAmount}("");
+            require(success, "ETH refund failed");
         }
 
         // Add or update contributor record
         if (contributions[msg.sender].amount == 0) {
             contributors.push(Contributor(msg.sender, tierDivisor));
-            contributions[msg.sender] = ContributionAmount(0, contributors.length - 1);
+            contributions[msg.sender] = ContributionAmount(0, contributors.length - 1, block.timestamp);
         } else {
             if (contributors[contributions[msg.sender].index].tierDivisor != tierDivisor) {
                 revert("You already contributed in another tier");
@@ -215,9 +358,13 @@ contract BAO is Ownable, ReentrancyGuard {
             usdValue: effectiveUsdValue
         }));
         
-        // Update totals
+        // Update cached amount
         contributions[msg.sender].amount += effectiveUsdValue;
+        contributions[msg.sender].cachedAt = block.timestamp;
+        
+        // Update totals
         totalRaised += effectiveUsdValue;
+        lastTotalRaisedUpdate = block.timestamp;
 
         emit Contribution(msg.sender, effectiveUsdValue, address(0), effectiveContribution);
 
@@ -239,22 +386,34 @@ contract BAO is Ownable, ReentrancyGuard {
         require(amount > 0, "Contribution must be greater than 0");
         require(supportedTokens[token].isEnabled, "Token not supported");
         
+        // If user previously refunded, clear that flag when they contribute again
+        if (hasRefunded[msg.sender]) {
+            hasRefunded[msg.sender] = false;
+        }
+        
         // Update price feed if needed (this needs to happen before price check)
         if (updateData.length > 0) {
             uint256 fee = pythOracle.getUpdateFee(updateData);
             require(msg.value >= fee, "Insufficient fee for Pyth price update");
             pythOracle.updatePriceFeeds{value: fee}(updateData);
             
-            // Refund excess fee
+            // Refund excess fee using .call instead of .transfer
             if (msg.value > fee) {
-                payable(msg.sender).transfer(msg.value - fee);
+                uint256 refundAmount = msg.value - fee;
+                (bool success,) = payable(msg.sender).call{value: refundAmount}("");
+                require(success, "Fee refund failed");
             }
         }
         
-        // Get token price from Pyth
-        PythStructs.Price memory tokenPrice = pythOracle.getPrice(supportedTokens[token].pythPriceId);
-        // Validate the price feed data
-        _validatePythPrice(tokenPrice, "Token price feed stale or invalid");
+        // Get token price from Pyth using the recommended EMA price function
+        PythStructs.Price memory tokenPrice = pythOracle.getEmaPriceNoOlderThan(
+            supportedTokens[token].pythPriceId, 
+            maxPriceAgeSecs
+        );
+        
+        // Check confidence interval for price
+        _validatePythPriceConfidence(tokenPrice, "Token price confidence interval too large");
+        
         uint256 tokenUsdPrice = _convertPythPriceToUint(tokenPrice, USD_DECIMALS);
         
         // Calculate USD value based on token decimals
@@ -268,13 +427,21 @@ contract BAO is Ownable, ReentrancyGuard {
         uint256 usdValue = (amount * tokenUsdPrice) / (10 ** tokenDecimals);
         require(usdValue >= minContributionAmount, "Below minimum contribution");
         
+        // For gating checks, always use latest contribution value
+        uint256 currentContribution = 0;
+        if (dynamicRecalculationEnabled) {
+            currentContribution = getCurrentUsdContribution(msg.sender);
+        } else {
+            currentContribution = contributions[msg.sender].amount;
+        }
+        
         // Check whitelist and contribution limits in USD
         if (maxWhitelistAmount > 0) {
             require(whitelist[msg.sender], "You are not whitelisted");
-            require(contributions[msg.sender].amount + usdValue <= maxWhitelistAmount, "Exceeding maxWhitelistAmount");
+            require(currentContribution + usdValue <= maxWhitelistAmount, "Exceeding maxWhitelistAmount");
         } else if (maxPublicContributionAmount > 0) {
             require(
-                contributions[msg.sender].amount + usdValue <= maxPublicContributionAmount,
+                currentContribution + usdValue <= maxPublicContributionAmount,
                 "Exceeding maxPublicContributionAmount"
             );
         }
@@ -283,8 +450,15 @@ contract BAO is Ownable, ReentrancyGuard {
         uint256 effectiveAmount = amount;
         uint256 effectiveUsdValue = usdValue;
         
-        if (totalRaised + usdValue > fundraisingGoal) {
-            effectiveUsdValue = fundraisingGoal - totalRaised;
+        // First, get updated total raised to make accurate decision
+        uint256 currentTotalRaised = totalRaised;
+        if (dynamicRecalculationEnabled && block.timestamp > lastTotalRaisedUpdate + 1 hours) {
+            // Only update if it's been more than an hour since last update
+            currentTotalRaised = updateTotalRaised();
+        }
+        
+        if (currentTotalRaised + usdValue > fundraisingGoal) {
+            effectiveUsdValue = fundraisingGoal - currentTotalRaised;
             effectiveAmount = (effectiveUsdValue * (10 ** tokenDecimals)) / tokenUsdPrice;
         }
         
@@ -292,7 +466,7 @@ contract BAO is Ownable, ReentrancyGuard {
         // Add or update contributor record
         if (contributions[msg.sender].amount == 0) {
             contributors.push(Contributor(msg.sender, tierDivisor));
-            contributions[msg.sender] = ContributionAmount(0, contributors.length - 1);
+            contributions[msg.sender] = ContributionAmount(0, contributors.length - 1, block.timestamp);
         } else {
             if (contributors[contributions[msg.sender].index].tierDivisor != tierDivisor) {
                 revert("You already contributed in another tier");
@@ -306,19 +480,17 @@ contract BAO is Ownable, ReentrancyGuard {
             usdValue: effectiveUsdValue
         }));
         
-        // Update totals
+        // Update cached amount and timestamp
         contributions[msg.sender].amount += effectiveUsdValue;
+        contributions[msg.sender].cachedAt = block.timestamp;
+        
+        // Update totals
         totalRaised += effectiveUsdValue;
+        lastTotalRaisedUpdate = block.timestamp;
         
         // 3. INTERACTIONS: External calls
-        // Transfer tokens to this contract
-        if (effectiveAmount == amount) {
-            // Transfer the full amount
-            IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
-        } else {
-            // Transfer only the effective amount if it's less than the full amount
-            IERC20(token).safeTransferFrom(msg.sender, address(this), effectiveAmount);
-        }
+        // Transfer tokens to this contract - simplified to always use effectiveAmount
+        IERC20(token).safeTransferFrom(msg.sender, address(this), effectiveAmount);
         
         emit Contribution(msg.sender, effectiveUsdValue, token, effectiveAmount);
         
@@ -364,7 +536,7 @@ contract BAO is Ownable, ReentrancyGuard {
         
         ContributionAmount memory c = contributions[msg.sender];
         require(c.amount > 0, "You did not contribute");
-        require(!claimed[msg.sender], "Already claimed");
+        require(!hasClaimedNFT[msg.sender], "Already claimed NFT");
         
         // Calculate NFT ID based on contributor index
         uint256 tokenId = contributions[msg.sender].index + 1;
@@ -375,7 +547,7 @@ contract BAO is Ownable, ReentrancyGuard {
         
         // EFFECTS: Update internal state before external calls
         // Mark as claimed first - this prevents reentrancy attacks
-        claimed[msg.sender] = true;
+        hasClaimedNFT[msg.sender] = true;
         
         // Store the NFT ID for the contributor
         contributorNFTIds[msg.sender] = tokenId;
@@ -419,16 +591,43 @@ contract BAO is Ownable, ReentrancyGuard {
         string memory nftName,
         string memory nftSymbol,
         string memory nftBaseURI
-    ) external onlyOwner {
+    ) external {
+        // Allow either the owner or protocol admin to finalize - if protocol admin, 
+        // there's an additional requirement that deadline has passed
+        bool isOwner = msg.sender == owner();
+        bool isProtocolAdmin = msg.sender == protocolAdmin;
+        bool deadlinePassed = block.timestamp > fundraisingDeadline;
+        
+        require(isOwner || (isProtocolAdmin && deadlinePassed), 
+                "Only owner can finalize before deadline");
         require(goalReached, "Fundraising goal not reached");
         require(!fundraisingFinalized, "Fundraising already finalized");
 
+        // If dynamic recalculation is enabled, do one final update and then disable it
+        if (dynamicRecalculationEnabled) {
+            // Get fresh values for all contributions
+            updateTotalRaised();
+            
+            // Disable dynamic recalculation - we're locking in the values
+            dynamicRecalculationEnabled = false;
+            emit DynamicRecalculationDisabled();
+        }
+
         // Calculate total adjusted contributions for proportional allocation
+        totalAdjustedContributions = 0; // Reset to ensure accurate calculation
+        
         for (uint256 i = 0; i < contributors.length; i++) {
             address contributor = contributors[i].addr;
             uint256 contribution = contributions[contributor].amount;
+            
+            // Skip contributors who have no contribution (they might have been refunded)
+            if (contribution == 0) continue;
+            
             totalAdjustedContributions += contribution / contributors[i].tierDivisor;
         }
+        
+        // Make sure we have contributions to allocate shares
+        require(totalAdjustedContributions > 0, "No valid contributions to allocate shares");
 
         // Create NFT contract for contributors with custom name, symbol and URI
         // The DAO manager is set as the owner from the beginning
@@ -446,6 +645,10 @@ contract BAO is Ownable, ReentrancyGuard {
         for (uint256 i = 0; i < contributors.length; i++) {
             address contributor = contributors[i].addr;
             uint256 contribution = contributions[contributor].amount;
+            
+            // Skip contributors who have no contribution (they might have been refunded)
+            if (contribution == 0) continue;
+            
             uint256 adjustedContribution = contribution / contributors[i].tierDivisor;
             
             // Calculate shares proportional to contribution out of MAX_SUPPLY
@@ -461,11 +664,23 @@ contract BAO is Ownable, ReentrancyGuard {
     function refund() external nonReentrant {
         require(!goalReached, "Fundraising goal was reached");
         require(block.timestamp > fundraisingDeadline, "Deadline not reached yet");
-        require(contributions[msg.sender].amount > 0, "No contributions to refund");
-        require(!claimed[msg.sender], "Already claimed refund");
+        
+        // Use dynamic calculation if enabled, otherwise use cached value
+        uint256 contributedAmountInUsd = dynamicRecalculationEnabled 
+            ? getCurrentUsdContribution(msg.sender)
+            : contributions[msg.sender].amount;
+            
+        require(contributedAmountInUsd > 0, "No contributions to refund");
+        require(!hasRefunded[msg.sender], "Already refunded");
 
-        uint256 contributedAmountInUsd = contributions[msg.sender].amount;
+        // Set cached amount to 0
         contributions[msg.sender].amount = 0;
+        
+        // Decrease totalRaised to reflect the refund
+        uint256 oldTotalRaised = totalRaised;
+        totalRaised -= contributedAmountInUsd;
+        lastTotalRaisedUpdate = block.timestamp;
+        emit TotalRaisedUpdated(oldTotalRaised, totalRaised, "Refund processed");
         
         // Refund all token contributions
         TokenContribution[] storage tokenContribs = tokenContributions[msg.sender];
@@ -473,9 +688,13 @@ contract BAO is Ownable, ReentrancyGuard {
             TokenContribution storage contrib = tokenContribs[i];
             
             if (contrib.token == address(0)) {
-                // Refund ETH
-                payable(msg.sender).transfer(contrib.amount);
+                // Refund ETH using .call instead of .transfer
+                (bool success,) = payable(msg.sender).call{value: contrib.amount}("");
+                require(success, "ETH refund failed");
                 emit Refund(msg.sender, address(0), contrib.amount);
+            } else if (contrib.token == address(1)) {
+                // Skip OTC contributions (they can't be refunded)
+                continue;
             } else {
                 // Refund ERC20 tokens
                 IERC20(contrib.token).safeTransfer(msg.sender, contrib.amount);
@@ -483,7 +702,11 @@ contract BAO is Ownable, ReentrancyGuard {
             }
         }
         
-        claimed[msg.sender] = true;
+        // Mark as refunded but don't prevent future contributions
+        hasRefunded[msg.sender] = true;
+        
+        // Also clear token contributions to avoid double refunds if they contribute again
+        delete tokenContributions[msg.sender];
     }
 
     // This function is for the DAO manager to execute transactions with the raised funds
@@ -659,7 +882,7 @@ contract BAO is Ownable, ReentrancyGuard {
         // Add or update contributor record
         if (contributions[contributor].amount == 0) {
             contributors.push(Contributor(contributor, tierDivisor));
-            contributions[contributor] = ContributionAmount(0, contributors.length - 1);
+            contributions[contributor] = ContributionAmount(0, contributors.length - 1, block.timestamp);
         } else {
             if (contributors[contributions[contributor].index].tierDivisor != tierDivisor) {
                 revert("Contributor already contributed in another tier");
@@ -712,15 +935,19 @@ contract BAO is Ownable, ReentrancyGuard {
     function withdraw() external onlyOwner {
         require(fundraisingFinalized, "Fundraising not finalized");
         
-        // Transfer all ETH
-        payable(owner()).transfer(address(this).balance);
+        // Transfer all ETH using .call instead of .transfer
+        uint256 balance = address(this).balance;
+        if (balance > 0) {
+            (bool success,) = payable(owner()).call{value: balance}("");
+            require(success, "ETH transfer failed");
+        }
         
         // Transfer all supported ERC20 tokens
         for (uint256 i = 0; i < supportedTokensList.length; i++) {
             address token = supportedTokensList[i];
-            uint256 balance = IERC20(token).balanceOf(address(this));
-            if (balance > 0) {
-                IERC20(token).safeTransfer(owner(), balance);
+            uint256 tokenBalance = IERC20(token).balanceOf(address(this));
+            if (tokenBalance > 0) {
+                IERC20(token).safeTransfer(owner(), tokenBalance);
             }
         }
     }
@@ -780,18 +1007,11 @@ contract BAO is Ownable, ReentrancyGuard {
     }
 
     /**
-     * @dev Helper function to validate Pyth price data freshness
+     * @dev Helper function to validate Pyth price confidence interval
      * @param price The Pyth price structure to validate
      * @param errorMessage The error message to revert with if validation fails
      */
-    function _validatePythPrice(PythStructs.Price memory price, string memory errorMessage) internal view {
-        // 1. Check if the price is too old
-        require(
-            (block.timestamp - uint256(price.publishTime)) <= maxPriceAgeSecs,
-            errorMessage
-        );
-        
-        // 2. Check confidence interval
+    function _validatePythPriceConfidence(PythStructs.Price memory price, string memory errorMessage) internal view {
         // Calculate confidence interval as a percentage of the price
         // price.conf is the absolute confidence value (+/-)
         uint256 confPercent = 0;
@@ -799,7 +1019,7 @@ contract BAO is Ownable, ReentrancyGuard {
             confPercent = (uint256(price.conf) * 10000) / uint256(uint64(price.price));
         }
         
-        require(confPercent <= maxConfidenceInterval, "Price confidence interval too large");
+        require(confPercent <= maxConfidenceInterval, errorMessage);
     }
 
     /**
@@ -834,5 +1054,235 @@ contract BAO is Ownable, ReentrancyGuard {
             // No adjustment needed
             return rawPrice;
         }
+    }
+
+    /**
+     * @notice Update the total raised amount after refunds
+     * @dev This function can be called to recalculate totalRaised in case of inconsistencies
+     */
+    function recalculateTotalRaised() external {
+        require(msg.sender == owner() || msg.sender == protocolAdmin, "Must be owner or protocolAdmin");
+        require(!fundraisingFinalized, "Fundraising already finalized");
+        
+        uint256 oldTotalRaised = totalRaised;
+        uint256 newTotalRaised = 0;
+        
+        // Recalculate by summing all contributors' amounts
+        for (uint256 i = 0; i < contributors.length; i++) {
+            newTotalRaised += contributions[contributors[i].addr].amount;
+        }
+        
+        totalRaised = newTotalRaised;
+        emit TotalRaisedUpdated(oldTotalRaised, newTotalRaised, "Manual recalculation");
+    }
+
+    // Add new function to allow a user to contribute again after refund
+    function contributeAfterRefund() external {
+        // Reset refund flag if user wants to contribute again
+        // This will be handled automatically by new contributions
+        if (hasRefunded[msg.sender]) {
+            hasRefunded[msg.sender] = false;
+        }
+    }
+
+    /**
+     * @notice Force disable dynamic recalculation (in case of oracle issues)
+     * @dev This locks in current cached values
+     */
+    function disableDynamicRecalculation() external {
+        require(msg.sender == owner() || msg.sender == protocolAdmin, "Must be owner or protocolAdmin");
+        require(dynamicRecalculationEnabled, "Already disabled");
+        
+        dynamicRecalculationEnabled = false;
+        emit DynamicRecalculationDisabled();
+    }
+    
+    /**
+     * @notice Force a full recalculation for a specific contributor
+     * @param contributor Address of the contributor to recalculate
+     */
+    function recalculateContribution(address contributor) external {
+        require(msg.sender == owner() || msg.sender == protocolAdmin || msg.sender == contributor, 
+                "Must be owner, protocolAdmin, or the contributor");
+        require(dynamicRecalculationEnabled, "Dynamic recalculation disabled");
+        require(!fundraisingFinalized, "Fundraising already finalized");
+        
+        uint256 oldValue = contributions[contributor].amount;
+        uint256 newValue = getCurrentUsdContribution(contributor);
+        
+        // Update cached value
+        contributions[contributor].amount = newValue;
+        contributions[contributor].cachedAt = block.timestamp;
+        
+        // Update total raised
+        if (oldValue != newValue) {
+            uint256 oldTotalRaised = totalRaised;
+            if (newValue > oldValue) {
+                totalRaised += (newValue - oldValue);
+            } else {
+                totalRaised -= (oldValue - newValue);
+            }
+            emit TotalRaisedUpdated(oldTotalRaised, totalRaised, "Single contribution update");
+        }
+        
+        emit ContributionValuesRecalculated(contributor, oldValue, newValue);
+    }
+
+    /**
+     * @notice Refund an OTC (over-the-counter) contribution
+     * @dev Only callable by the DAO manager or protocol admin who have the actual off-chain asset
+     * @param contributor The address of the contributor to refund
+     * @param description Optional description of the OTC refund (e.g., "Returning Cryptopunk #1234")
+     */
+    function refundOtcContribution(address contributor, string calldata description) external nonReentrant {
+        require(msg.sender == owner() || msg.sender == protocolAdmin, "Must be owner or protocolAdmin");
+        require(!fundraisingFinalized, "Fundraising already finalized");
+        require(!hasRefunded[contributor], "Contributor already fully refunded");
+        
+        // Find all OTC contributions for this contributor
+        TokenContribution[] storage tokenContribs = tokenContributions[contributor];
+        uint256 totalOtcValue = 0;
+        
+        // Count the number of OTC contributions and keep track of their indices
+        uint256[] memory otcIndices = new uint256[](tokenContribs.length);
+        uint256 otcCount = 0;
+        
+        for (uint256 i = 0; i < tokenContribs.length; i++) {
+            if (tokenContribs[i].token == address(1)) {
+                totalOtcValue += tokenContribs[i].usdValue;
+                otcIndices[otcCount] = i;
+                otcCount++;
+            }
+        }
+        
+        require(totalOtcValue > 0, "No OTC contributions found");
+        
+        // Update contributor's record
+        uint256 oldContributionAmount = contributions[contributor].amount;
+        contributions[contributor].amount -= totalOtcValue;
+        
+        // Update totalRaised
+        uint256 oldTotalRaised = totalRaised;
+        totalRaised -= totalOtcValue;
+        
+        // Before removing, check if this was the only contribution
+        bool wasOnlyContribution = (oldContributionAmount == totalOtcValue);
+        
+        // Remove OTC contributions from the array (starting from the end to avoid shifting issues)
+        for (uint256 i = otcCount; i > 0; i--) {
+            uint256 index = otcIndices[i - 1];
+            
+            // If this is the last element, just pop it
+            if (index == tokenContribs.length - 1) {
+                tokenContribs.pop();
+            } else {
+                // Otherwise, swap with the last element and pop
+                tokenContribs[index] = tokenContribs[tokenContribs.length - 1];
+                tokenContribs.pop();
+            }
+        }
+        
+        // If this was the only contribution, consider the user fully refunded
+        if (wasOnlyContribution) {
+            hasRefunded[contributor] = true;
+        }
+        
+        // Update the timestamps
+        lastTotalRaisedUpdate = block.timestamp;
+        contributions[contributor].cachedAt = block.timestamp;
+        
+        // Emit events
+        emit OTCRefund(contributor, totalOtcValue, description);
+        emit TotalRaisedUpdated(oldTotalRaised, totalRaised, "OTC refund");
+        emit ContributionValuesRecalculated(contributor, oldContributionAmount, contributions[contributor].amount);
+    }
+    
+    /**
+     * @notice Refund a specific OTC contribution when a contributor has multiple
+     * @dev More granular than refundOtcContribution which refunds all OTC contributions
+     * @param contributor The address of the contributor to refund
+     * @param otcIndex The index of the OTC contribution in their contributions array
+     * @param description Optional description of the OTC refund
+     */
+    function refundSpecificOtcContribution(
+        address contributor, 
+        uint256 otcIndex, 
+        string calldata description
+    ) external nonReentrant {
+        require(msg.sender == owner() || msg.sender == protocolAdmin, "Must be owner or protocolAdmin");
+        require(!fundraisingFinalized, "Fundraising already finalized");
+        
+        TokenContribution[] storage tokenContribs = tokenContributions[contributor];
+        require(otcIndex < tokenContribs.length, "Invalid OTC index");
+        require(tokenContribs[otcIndex].token == address(1), "Not an OTC contribution");
+        
+        // Get the value of this specific OTC contribution
+        uint256 otcValue = tokenContribs[otcIndex].usdValue;
+        
+        // Update contributor's record
+        uint256 oldContributionAmount = contributions[contributor].amount;
+        contributions[contributor].amount -= otcValue;
+        
+        // Update totalRaised
+        uint256 oldTotalRaised = totalRaised;
+        totalRaised -= otcValue;
+        
+        // Before removing, check if this was the only contribution
+        bool wasOnlyContribution = (oldContributionAmount == otcValue);
+        
+        // Remove this specific OTC contribution
+        if (otcIndex == tokenContribs.length - 1) {
+            tokenContribs.pop();
+        } else {
+            tokenContribs[otcIndex] = tokenContribs[tokenContribs.length - 1];
+            tokenContribs.pop();
+        }
+        
+        // If this was the only contribution, consider the user fully refunded
+        if (wasOnlyContribution) {
+            hasRefunded[contributor] = true;
+        }
+        
+        // Update the timestamps
+        lastTotalRaisedUpdate = block.timestamp;
+        contributions[contributor].cachedAt = block.timestamp;
+        
+        // Emit events
+        emit OTCRefund(contributor, otcValue, description);
+        emit TotalRaisedUpdated(oldTotalRaised, totalRaised, "Specific OTC refund");
+        emit ContributionValuesRecalculated(contributor, oldContributionAmount, contributions[contributor].amount);
+    }
+    
+    /**
+     * @notice Get all OTC contributions for a contributor
+     * @param contributor Address of the contributor
+     * @return indices Array of indices of OTC contributions in their token contributions array
+     * @return values Array of USD values of each OTC contribution
+     */
+    function getOtcContributions(address contributor) external view returns (uint256[] memory indices, uint256[] memory values) {
+        TokenContribution[] storage tokenContribs = tokenContributions[contributor];
+        
+        // First count the OTC contributions
+        uint256 otcCount = 0;
+        for (uint256 i = 0; i < tokenContribs.length; i++) {
+            if (tokenContribs[i].token == address(1)) {
+                otcCount++;
+            }
+        }
+        
+        // Now fill the arrays
+        indices = new uint256[](otcCount);
+        values = new uint256[](otcCount);
+        
+        uint256 currentIndex = 0;
+        for (uint256 i = 0; i < tokenContribs.length; i++) {
+            if (tokenContribs[i].token == address(1)) {
+                indices[currentIndex] = i;
+                values[currentIndex] = tokenContribs[i].usdValue;
+                currentIndex++;
+            }
+        }
+        
+        return (indices, values);
     }
 }

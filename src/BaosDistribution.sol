@@ -131,15 +131,8 @@ contract BaosDistribution is Ownable, ReentrancyGuard {
         // Iterate through all NFTs up to maxNFTId
         for (uint256 tokenId = 1; tokenId <= maxNFTId; tokenId++) {
             try equityNFT.ownerOf(tokenId) returns (address nftOwner) {
-                // NFT exists, calculate token amount
-                uint256 tokenShares;
-                
-                try equityNFT.getEquityShares(tokenId) returns (uint256 shares) {
-                    tokenShares = shares;
-                } catch {
-                    // Skip if we can't get shares
-                    continue; 
-                }
+                // NFT exists, get token shares directly without redundant try-catch
+                uint256 tokenShares = equityNFT.getEquityShares(tokenId);
                 
                 uint256 amount = (totalAmount * tokenShares) / totalShares;
                 
@@ -187,15 +180,8 @@ contract BaosDistribution is Ownable, ReentrancyGuard {
         
         for (uint256 tokenId = startTokenId; tokenId <= endTokenId; tokenId++) {
             try equityNFT.ownerOf(tokenId) returns (address nftOwner) {
-                // NFT exists, calculate token amount
-                uint256 tokenShares;
-                
-                try equityNFT.getEquityShares(tokenId) returns (uint256 shares) {
-                    tokenShares = shares;
-                } catch {
-                    // Skip if we can't get shares
-                    continue; 
-                }
+                // NFT exists, get token shares directly without redundant try-catch
+                uint256 tokenShares = equityNFT.getEquityShares(tokenId);
                 
                 uint256 amount = (totalAmount * tokenShares) / totalShares;
                 

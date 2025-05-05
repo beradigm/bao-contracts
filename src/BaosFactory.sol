@@ -35,10 +35,9 @@ contract BaosFactory is Ownable {
         // Ensure protocol admin is set
         BAO.DaoConfig memory updatedConfig = config;
         
-        // If protocolAdmin is not set in config, use the factory's protocolAdmin
-        if (updatedConfig.protocolAdmin == address(0)) {
-            updatedConfig.protocolAdmin = protocolAdmin;
-        }
+        // Always use the factory's protocolAdmin regardless of the input config
+        // This ensures the protocol admin cannot be overridden by individual BAO deployments
+        updatedConfig.protocolAdmin = protocolAdmin;
 
         BAO dao = new BAO(updatedConfig);
 
